@@ -13,6 +13,9 @@ import type { NativeSubagentRuntimePolicy } from '../services/native-subagent-ru
 import type { CodexServiceTier } from '../services/codex-service-tier.js';
 import { normalizeQuotaFallbackBotConfig } from '../services/quota-fallback.js';
 import { normalizeEnvPolicy, type EnvPolicy } from '../core/env-policy.js';
+import type { TraexAutoModelConfig } from '../services/traex-auto-model.js';
+import { readGlobalConfig } from '../global-config.js';
+import { resolveBotCodexRpcInput } from '../services/codex-rpc-input-policy.js';
 
 /** Shared parser so a malformed payload can't reach the selector half-shaped;
  *  anything invalid degrades to the registry default (`inherit`). */
@@ -35,6 +38,8 @@ export interface DashboardBotDescriptor {
   wrapperCli?: string;
   cliLaunchMode?: CliLaunchMode;
   model?: string;
+  traexAutoModel?: TraexAutoModelConfig;
+  codexRpcInput?: boolean;
   modelBackendVariant?: 'standard' | 'max';
   reasoningEffort?: string;
   serviceTier?: CodexServiceTier;
@@ -92,6 +97,12 @@ export function botSummaryPayload(bot: DashboardBotDescriptor) {
 }
 
 export function botDefaultsPayload(bot: DashboardBotDescriptor, j?: any, error?: string) {
+  const rpcOverride = typeof j?.codexRpcInput === 'boolean' ? j.codexRpcInput
+    : j && Object.prototype.hasOwnProperty.call(j, 'codexRpcInput') ? undefined : bot.codexRpcInput;
+  const rpcDefault = typeof j?.codexRpcInputDefault === 'boolean'
+    ? j.codexRpcInputDefault : readGlobalConfig().dashboard?.codexRpcInput === true;
+  const auto = j && Object.prototype.hasOwnProperty.call(j, 'traexAutoModel') ? j.traexAutoModel : bot.traexAutoModel;
+  const rpcCliId = j?.cliId ?? bot.cliId;
   const base = {
     larkAppId: bot.larkAppId,
     botName: bot.botName,
@@ -102,6 +113,15 @@ export function botDefaultsPayload(bot: DashboardBotDescriptor, j?: any, error?:
     ...(bot.wrapperCli ? { wrapperCli: bot.wrapperCli } : {}),
     ...(bot.cliLaunchMode ? { cliLaunchMode: bot.cliLaunchMode } : {}),
     ...(bot.model ? { model: bot.model } : {}),
+    ...(bot.traexAutoModel ? { traexAutoModel: bot.traexAutoModel } : {}),
+    codexRpcInput: rpcOverride ?? null,
+    codexRpcInputDefault: rpcDefault,
+    codexRpcInputEffective: resolveBotCodexRpcInput({
+      cliId: rpcCliId, model: j?.model ?? bot.model, traexAutoModel: auto, codexRpcInput: rpcOverride,
+      wrapperCli: j && Object.prototype.hasOwnProperty.call(j, 'wrapperCli') ? j.wrapperCli : bot.wrapperCli,
+      cliLaunchMode: j && Object.prototype.hasOwnProperty.call(j, 'cliLaunchMode') ? j.cliLaunchMode : bot.cliLaunchMode,
+    }, rpcDefault),
+    traexAutoModelBlockedReason: null,
     ...(bot.modelBackendVariant ? { modelBackendVariant: bot.modelBackendVariant } : {}),
     ...(bot.reasoningEffort ? { reasoningEffort: bot.reasoningEffort } : {}),
     ...(bot.serviceTier ? { serviceTier: bot.serviceTier } : {}),
@@ -137,6 +157,8 @@ export function botDefaultsPayload(bot: DashboardBotDescriptor, j?: any, error?:
     workingDir: typeof j?.workingDir === 'string' ? j.workingDir : null,
     defaultWorkingDirAutoWorktree: j?.defaultWorkingDirAutoWorktree === true,
     autoboundChatCount: j?.autoboundChatCount ?? 0,
+    // 当前 oncall 绑定数。旧 daemon 不回这个字段 → null，页面只显示自动绑定过的数量。
+    oncallChatCount: typeof j?.oncallChatCount === 'number' ? j.oncallChatCount : null,
     brandLabel: j?.brandLabel ?? null,
     // Private Bot Defaults payload only. Keep the persisted shape sparse and
     // drop malformed hand edits field-by-field before they reach form state.
@@ -181,6 +203,7 @@ export function botDefaultsPayload(bot: DashboardBotDescriptor, j?: any, error?:
       || (typeof j?.codexBrowser === 'object' && j.codexBrowser?.enabled === true),
     writableTerminalLinkInCard: j?.writableTerminalLinkInCard === true,
     privateCard: j?.privateCard === true,
+    replyCardActions: j?.replyCardActions === true,
     cotEnabled: normalizeCotEnabled(j),
     senderTag: j?.senderTag !== false,
     senderTagHideEmail: j?.senderTagHideEmail === true,

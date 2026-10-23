@@ -213,6 +213,7 @@ import {
 // grant-pending is a real (unmocked) module-level table; reset it per test so the
 // grant-card throttle state never leaks across cases (it backs the @blocked card path).
 import { getPendingGrantLimits, _resetForTest as _resetGrantPending } from '../src/im/lark/grant-pending.js';
+import { localeForBot, t } from '../src/i18n/index.js';
 import { hasTriggeredMessage } from '../src/services/triggered-message-store.js';
 import { logger } from '../src/utils/logger.js';
 import { config } from '../src/config.js';
@@ -1106,9 +1107,10 @@ describe('startLarkEventDispatcher — connection wiring', () => {
 describe('Lark event dispatcher — durable primary processor', () => {
   const processPrimary = (
     runtime: ReturnType<typeof createLarkEventDispatcherRuntime>,
-    data: ReturnType<typeof makeUserMessageEvent>,
+    data: ReturnType<typeof makeUserMessageEvent> | ReturnType<typeof makeBotMessageEvent>,
     messageId: string,
     queuePostAdmissionOutput?: (output: unknown) => void,
+    queuePostAdmissionControl?: (event: unknown) => void,
   ) => runtime.processDurableMessage({
     eventType: 'lark.im.message.receive_v1',
     eventId: `im.message.receive_v1:${MY_APP_ID}:${messageId}`,
@@ -1128,6 +1130,7 @@ describe('Lark event dispatcher — durable primary processor', () => {
     },
     signal: new AbortController().signal,
     queuePostAdmissionOutput: queuePostAdmissionOutput ?? (() => undefined),
+    queuePostAdmissionControl: queuePostAdmissionControl ?? (() => undefined),
   });
 
   it('persists recalled-message events before applying the local tombstone', async () => {
@@ -1342,6 +1345,53 @@ describe('Lark event dispatcher — durable primary processor', () => {
       content: 'blocked',
       providerUuid: 'primary_output',
     });
+    runtime.close();
+  });
+
+  it('exposes the canonical post-admission control queue to a mentioned bot sender', async () => {
+    setupBotState({ allowedUsers: [OTHER_BOT_OPEN_ID] });
+    mockGetChatMode.mockResolvedValue('topic');
+    const handlers = makeHandlers();
+    handlers.isSessionOwner.mockReturnValue(true);
+    const control = {
+      eventId: `lark-command.session-control:${MY_APP_ID}:om_primary_bot_close`,
+      lane: 'session-control',
+      partitionKey: `lark-session-control:${MY_APP_ID}:session-primary-bot-close`,
+      payload: { type: 'botmux.session.control' },
+      visibleAt: 1,
+      createdAt: 1,
+    };
+    handlers.handleThreadReply.mockImplementation(async (_data: any, ctx: any) => {
+      ctx.queuePostAdmissionControl(control);
+      ctx.ingressAdmission = { admitted: true };
+    });
+    handlers.resolveDurableSession = vi.fn(() => ({
+      sessionId: 'session-primary-bot-close', chatId: 'chat-primary', rootMessageId: 'om_primary_root',
+      scope: 'thread', title: 'Primary bot close', status: 'active',
+      createdAt: '2026-10-22T00:00:00.000Z', larkAppId: MY_APP_ID,
+    }));
+    const queuedControl = vi.fn();
+    const runtime = createLarkEventDispatcherRuntime(MY_APP_ID, 'secret', handlers);
+    const data = makeBotMessageEvent({
+      senderOpenId: OTHER_BOT_OPEN_ID,
+      senderType: 'bot',
+      content: JSON.stringify({ text: '@BotA /close' }),
+      messageId: 'om_primary_bot_close',
+      rootId: 'om_primary_root',
+      chatId: 'chat-primary',
+      chatType: 'group',
+      mentions: [{ key: '@_bot_a', name: 'BotA', id: { open_id: MY_OPEN_ID } }],
+    });
+
+    await expect(processPrimary(
+      runtime,
+      data,
+      'om_primary_bot_close',
+      undefined,
+      queuedControl,
+    )).resolves.toMatchObject({ kind: 'admitted' });
+    expect(handlers.handleThreadReply).toHaveBeenCalledOnce();
+    expect(queuedControl).toHaveBeenCalledWith(control);
     runtime.close();
   });
 
@@ -2432,13 +2482,22 @@ describe('Lark event dispatcher — durable primary processor', () => {
       const handlers = makeHandlers();
       const enqueuePrimary = vi.fn(async () => ({ kind: 'inserted' as const }));
       const enqueuePrimaryControl = vi.fn(async () => ({ kind: 'inserted' as const }));
+      const pendingPrimaryControlCard = vi.fn(async () => ({
+        schema: '2.0',
+        body: { elements: [{ tag: 'markdown', content: `${action}-pending` }] },
+      }));
       const runtime = createLarkEventDispatcherRuntime(
         MY_APP_ID,
         'secret',
         handlers,
         'feishu',
         undefined,
-        { enqueuePrimary, enqueuePrimaryControl, authorizePrimaryControl: () => true },
+        {
+          enqueuePrimary,
+          enqueuePrimaryControl,
+          authorizePrimaryControl: () => true,
+          pendingPrimaryControlCard,
+        },
       );
       runtime.connect();
 
@@ -2461,7 +2520,13 @@ describe('Lark event dispatcher — durable primary processor', () => {
         : { event_id: `evt_${action}_1`, ...inner };
       const result = await capturedHandlers['card.action.trigger'](data);
 
-      expect(result).toMatchObject({ toast: { type: 'info' } });
+      expect(result).toMatchObject({
+        toast: { type: 'info' },
+        card: {
+          type: 'raw',
+          data: { body: { elements: [{ content: `${action}-pending` }] } },
+        },
+      });
       expect(enqueuePrimaryControl).toHaveBeenCalledTimes(1);
       expect(enqueuePrimaryControl).toHaveBeenCalledWith(expect.objectContaining({
         eventId: `card.action.trigger:${MY_APP_ID}:evt_${action}_1`,
@@ -2478,9 +2543,42 @@ describe('Lark event dispatcher — durable primary processor', () => {
       }
       expect(handlers.handleCardAction).not.toHaveBeenCalled();
       expect(enqueuePrimary).not.toHaveBeenCalled();
+      expect(pendingPrimaryControlCard).toHaveBeenCalledWith(enqueued.data);
       runtime.close();
     },
   );
+
+  it('does not repaint a completed lifecycle card on duplicate durable delivery', async () => {
+    setupBotState({ allowedUsers: [USER_OPEN_ID] });
+    const handlers = makeHandlers();
+    const pendingPrimaryControlCard = vi.fn(async () => ({ schema: '2.0' }));
+    const runtime = createLarkEventDispatcherRuntime(
+      MY_APP_ID,
+      'secret',
+      handlers,
+      'feishu',
+      undefined,
+      {
+        enqueuePrimary: vi.fn(async () => ({ kind: 'inserted' as const })),
+        enqueuePrimaryControl: vi.fn(async () => ({ kind: 'duplicate' as const })),
+        authorizePrimaryControl: () => true,
+        pendingPrimaryControlCard,
+      },
+    );
+    runtime.connect();
+
+    const result = await capturedHandlers['card.action.trigger']({
+      event_id: 'evt_close_duplicate',
+      action: { value: { action: 'close', session_id: 'session-primary', root_id: 'om_root' } },
+      operator: { open_id: USER_OPEN_ID },
+      context: { open_message_id: 'om_card' },
+    });
+
+    expect(result).toMatchObject({ toast: { type: 'info' } });
+    expect(result.card).toBeUndefined();
+    expect(pendingPrimaryControlCard).not.toHaveBeenCalled();
+    runtime.close();
+  });
 
   it('keeps read-only card actions available in durable primary mode', async () => {
     setupBotState({ allowedUsers: [USER_OPEN_ID] });
@@ -8350,10 +8448,15 @@ describe('im.message.receive_v1 — p2p from a non-allowed user (grantRequestToO
     const [, replyTo, ack] = mockReplyMessage.mock.calls[0] as any[];
     expect(replyTo).toBe('msg-dm-stranger-1');
     expect(ack).not.toContain(OWNER);
-    // pending 已开：同一人继续发不会重复发卡
+    // pending 已开：同一人继续发不会重复发卡，只回一句「还在等确认」
     await capturedHandlers['im.message.receive_v1'](strangerDm('msg-dm-stranger-2'));
     await flushEventWork();
     expect(mockSendUserMessage).toHaveBeenCalledTimes(1);
+    expect(mockReplyMessage).toHaveBeenCalledTimes(2);
+    expect((mockReplyMessage.mock.calls[1] as any[]).slice(1, 3)).toEqual([
+      'msg-dm-stranger-2',
+      t('card.grant.request_still_pending', undefined, localeForBot(MY_APP_ID)),
+    ]);
   });
 
   it('autoGrantRequestCards=false wins over grantRequestToOwnerDm (silent drop)', async () => {
@@ -8382,6 +8485,75 @@ describe('im.message.receive_v1 — p2p from a non-allowed user (grantRequestToO
     await capturedHandlers['im.message.receive_v1'](strangerDm('msg-dm-stranger-retry'));
     await flushEventWork();
     expect(mockSendUserMessage).toHaveBeenCalledTimes(2);
+  });
+});
+
+describe('im.message.receive_v1 — blocked @ while the grant request card is pending', () => {
+  const OWNER = 'ou_owner_group';
+  const STRANGER = 'ou_stranger_group';
+  let handlers: ReturnType<typeof makeHandlers>;
+
+  beforeEach(() => {
+    capturedHandlers = {};
+    __resetAnchorQueues();
+    __resetEventClaimsForTest();
+    _resetGrantPending();
+    mockReplyMessage.mockReset().mockResolvedValue('msg-id');
+    mockGetOwnerOpenId.mockReset().mockReturnValue(OWNER);
+    mockGetUserProfile.mockReset().mockResolvedValue({ name: '访客甲' });
+    mockGetCachedChatMode.mockReset().mockReturnValue(undefined);
+    mockGetChatMode.mockResolvedValue('group');
+    mockFindOncallChat.mockReturnValue(undefined);
+    mockResolveSiblingBot.mockReset().mockResolvedValue({ ok: false, reason: 'default_no_sibling' });
+    mockReadFileSync.mockReturnValue('{}');
+    setupBotState({ allowedUsers: [OWNER] });
+    handlers = makeHandlers();
+    startLarkEventDispatcher(MY_APP_ID, 'secret', handlers);
+  });
+
+  const mention = [{ key: '@_bot_a', name: 'BotA', id: { open_id: MY_OPEN_ID } }];
+  const replyShapes = () => mockReplyMessage.mock.calls.map((c: any[]) => [c[1], c[3] ?? 'text']);
+
+  it('human: first @ sends the card, the next @ gets one reminder, nothing reaches a session', async () => {
+    for (const id of ['om_stranger_1', 'om_stranger_2', 'om_stranger_3']) {
+      await capturedHandlers['im.message.receive_v1'](makeUserMessageEvent({
+        senderOpenId: STRANGER,
+        content: JSON.stringify({ text: '@_bot_a 帮忙查一下' }),
+        messageId: id,
+        chatId: 'oc_group_pending',
+        chatType: 'group',
+        rootId: 'om_topic_root',
+        mentions: mention,
+      }));
+      await flushEventWork();
+    }
+
+    expect(replyShapes()).toEqual([
+      ['om_stranger_1', 'interactive'],
+      ['om_stranger_2', 'text'],
+    ]);
+    expect((mockReplyMessage.mock.calls[1] as any[])[2])
+      .toBe(t('card.grant.request_still_pending', undefined, localeForBot(MY_APP_ID)));
+    expect(handlers.handleNewTopic).not.toHaveBeenCalled();
+    expect(handlers.handleThreadReply).not.toHaveBeenCalled();
+  });
+
+  it('external bot: card once, then silent (bots get no reminder replies)', async () => {
+    for (const id of ['om_bot_1', 'om_bot_2']) {
+      await capturedHandlers['im.message.receive_v1'](makeBotMessageEvent({
+        senderOpenId: OTHER_BOT_OPEN_ID,
+        senderType: 'bot',
+        content: JSON.stringify({ text: '@_bot_a 帮忙查一下' }),
+        messageId: id,
+        chatId: 'oc_group_pending',
+        rootId: 'om_topic_root',
+        mentions: mention,
+      }));
+      await flushEventWork();
+    }
+
+    expect(replyShapes()).toEqual([['om_bot_1', 'interactive']]);
+    expect(handlers.handleThreadReply).not.toHaveBeenCalled();
   });
 });
 

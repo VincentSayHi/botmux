@@ -413,6 +413,7 @@ vi.mock('../src/core/worker-pool.js', () => ({
   }),
   isSessionTransferring: vi.fn(() => false),
   updateCodexAppEffort: vi.fn(async () => ({ status: 'applied' })),
+  updateCodexCliEffort: vi.fn(async () => ({ status: 'future_only', reason: 'cli_next_turn' })),
   sendWorkerSessionInput: vi.fn(() => true),
   // /close routes the「会话已关闭」card through this: ephemeral (visible-to-you)
   // when the chat supports it, else the visible reply fallback. The stub just
@@ -683,7 +684,7 @@ import { sessionKey } from '../src/core/types.js';
 import { setTerminalProxyPort } from '../src/core/terminal-url.js';
 import type { DaemonSession } from '../src/core/types.js';
 import type { LarkMessage, Session } from '../src/types.js';
-import { type CloseSessionResult, closeSession, closeSession as closeWorkerPoolSession, killWorker, teardownAuthoritativePersistentBackingBeforeClose, suspendWorker, forkWorker, forkAdoptWorker, forkSession, isForkCapableSession, getCurrentCliVersion, deliverEphemeralOrReply, deliverWritableTerminalCardTo, requestSessionRestart, updateCodexAppEffort, sendWorkerSessionInput, withActiveSessionKeyLock, postFreshStreamingCard, reconcileBotStreamingCardPins } from '../src/core/worker-pool.js';
+import { type CloseSessionResult, closeSession, closeSession as closeWorkerPoolSession, killWorker, teardownAuthoritativePersistentBackingBeforeClose, suspendWorker, forkWorker, forkAdoptWorker, forkSession, isForkCapableSession, getCurrentCliVersion, deliverEphemeralOrReply, deliverWritableTerminalCardTo, requestSessionRestart, updateCodexAppEffort, updateCodexCliEffort, sendWorkerSessionInput, withActiveSessionKeyLock, postFreshStreamingCard, reconcileBotStreamingCardPins } from '../src/core/worker-pool.js';
 import { dashboardEventBus, type DashboardEvent } from '../src/core/dashboard-events.js';
 import { publishClosedSessionPatch } from '../src/core/session-activity.js';
 import { getOwnerOpenId } from '../src/bot-registry.js';
@@ -5284,6 +5285,73 @@ describe('handleCommand', () => {
       );
       expect(selected, 'no 已选择 confirmation was sent').toBeDefined();
       expect(selected![4]).toBe('msg_prime');
+    });
+
+    // A first message whose start was refused because the directory it fell
+    // back to is missing: it stays staged for repo selection on a session that
+    // is no longer pendingRepo. When no recovery card could be sent, the reply
+    // points at `/repo <路径>` — which must pick the directory for that message.
+    function makeRefusedOpeningDs(sessionOverrides: Record<string, unknown> = {}): DaemonSession {
+      return makeDaemonSession({
+        pendingRepo: false,
+        worker: null,
+        hasHistory: false,
+        initialStartPending: true,
+        pendingPrompt: 'first prompt',
+        session: makeSession({
+          queued: true,
+          queuedPrompt: 'first prompt',
+          pendingRepoSetup: { mode: 'picker', linkRefMode: 'disabled', prompt: 'first prompt' },
+          ...sessionOverrides,
+        } as any),
+      });
+    }
+
+    it('starts a first message refused for its missing directory in the /repo-chosen one', async () => {
+      const ds = makeRefusedOpeningDs();
+      ds.workingDirRecovery = { path: '/gone/default-dir' };
+      const deps = makeDeps(ds);
+      deps.lastRepoScan.set(CHAT_ID, [
+        { name: 'project-a', path: '/home/testuser/project-a', branch: 'main' },
+      ]);
+
+      await handleCommand('/repo', ROOT_ID, makeLarkMessage('/repo 1'), deps, LARK_APP_ID);
+
+      const said = vi.mocked(deps.sessionReply).mock.calls.map(c => c[1]).join();
+      expect(said).not.toContain('未结算');
+      expect(forkWorker).toHaveBeenCalledTimes(1);
+      expect(vi.mocked(forkWorker).mock.calls[0]![0]).toBe(ds);
+      expect(sessionStore.createSession).not.toHaveBeenCalled();
+      expect(ds.workingDir).toBe('/home/testuser/project-a');
+      expect(ds.pendingRepo).toBe(false);
+      expect(ds.workingDirRecovery).toBeUndefined();
+    });
+
+    it('guides bare /repo to pass a path instead of blaming an unsettled Codex App turn when only the refused opening holds the session', async () => {
+      const ds = makeRefusedOpeningDs();
+      const deps = makeDeps(ds);
+
+      await handleCommand('/repo', ROOT_ID, makeLarkMessage('/repo'), deps, LARK_APP_ID);
+
+      const said = vi.mocked(deps.sessionReply).mock.calls.map(c => c[1]).join();
+      expect(said).toContain('/repo <');
+      expect(said).not.toContain('Codex App');
+      expect(said).not.toContain('未结算');
+      expect(forkWorker).not.toHaveBeenCalled();
+    });
+
+    it('still refuses /repo while an activation is actually in flight', async () => {
+      const ds = makeRefusedOpeningDs({ queuedActivationPending: true });
+      const deps = makeDeps(ds);
+      deps.lastRepoScan.set(CHAT_ID, [
+        { name: 'project-a', path: '/home/testuser/project-a', branch: 'main' },
+      ]);
+
+      await handleCommand('/repo', ROOT_ID, makeLarkMessage('/repo 1'), deps, LARK_APP_ID);
+
+      expect(vi.mocked(deps.sessionReply).mock.calls.map(c => c[1]).join()).toContain('未结算');
+      expect(forkWorker).not.toHaveBeenCalled();
+      expect(ds.pendingRepo).toBe(false);
     });
 
     it('should prompt to run /repo first when index given but no cached scan', async () => {
@@ -10142,6 +10210,20 @@ describe('/term — operable terminal slash command (operator / canOperate)', ()
 });
 
 describe('Codex App /effort command', () => {
+  it('uses the CLI menu path and explicitly reports next-turn scope', async () => {
+    vi.clearAllMocks();
+    vi.mocked(canOperate).mockReturnValue(true);
+    const ds = makeDaemonSession({ session: makeSession({ cliId: 'codex' }), lastScreenStatus: 'working' });
+    const deps = makeDeps(ds);
+    await handleCommand('/effort', ROOT_ID, makeLarkMessage('/effort max'), deps, LARK_APP_ID);
+    expect(updateCodexCliEffort).toHaveBeenCalledWith(ds, 'max');
+    expect(updateCodexAppEffort).not.toHaveBeenCalled();
+    expect(deps.sessionReply).toHaveBeenCalledWith(ROOT_ID,
+      t('cmd.effort.cli_next_turn', { effort: 'max', choices: '' }), undefined, LARK_APP_ID, 'msg_001');
+    expect(sendWorkerSessionInput).not.toHaveBeenCalled();
+    expect(requestSessionRestart).not.toHaveBeenCalled();
+  });
+
   beforeEach(() => {
     vi.clearAllMocks();
     vi.mocked(canOperate).mockReturnValue(true);

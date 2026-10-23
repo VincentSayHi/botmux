@@ -113,10 +113,13 @@ import {
 import {
   detachWorkerForTransfer,
   updateCodexAppEffort,
+  updateCodexCliEffort,
   initWorkerPool,
   __testOnly_setupWorkerHandlers,
 } from '../src/core/worker-pool.js';
 import { dashboardEventBus } from '../src/core/dashboard-events.js';
+import { logger } from '../src/utils/logger.js';
+import { updateSession } from '../src/services/session-store.js';
 import { getBot } from '../src/bot-registry.js';
 import * as sessionStore from '../src/services/session-store.js';
 import type { DaemonSession } from '../src/core/types.js';
@@ -502,7 +505,8 @@ describe('worker-pool lifecycle hook integration', () => {
     const ds = makeDs({ worker });
     ds.session.cliId = 'remote-runner';
     ds.session.backendType = 'remote-runner';
-    const reconcile = vi.fn(() => true);
+    ds.suppressRecoveryCard = true;
+    const reconcile = vi.fn(async () => true);
     __testOnly_setupWorkerHandlers(ds, worker, {
       ready: true,
       failureNotified: false,
@@ -522,7 +526,7 @@ describe('worker-pool lifecycle hook integration', () => {
     expect(sessionReply).not.toHaveBeenCalled();
   });
 
-  it('disarms remote rebuild reconciliation after backend state is durable', async () => {
+  it('keeps remote rebuild reconciliation armed while canonical commit is pending', async () => {
     const worker = makeFakeWorker();
     const ds = makeDs({ worker });
     ds.session.cliId = 'remote-runner';
@@ -532,6 +536,7 @@ describe('worker-pool lifecycle hook integration', () => {
       provider: 'reference',
       generation: 2,
     };
+    ds.suppressRecoveryCard = true;
     const reconcile = vi.fn(() => true);
     const startupState = {
       ready: true,
@@ -552,8 +557,42 @@ describe('worker-pool lifecycle hook integration', () => {
     await flush();
 
     expect(ds.session.remoteBackendState?.generation).toBe(3);
-    expect(startupState.onRemoteBackendStartupExit).toBeUndefined();
+    expect(startupState.onRemoteBackendStartupExit).toBe(reconcile);
     expect(reconcile).not.toHaveBeenCalled();
+  });
+
+  it('retires an exited remote provider after canonical commit without replaying startup rollback', async () => {
+    const sessionReply = vi.fn(async () => 'om_reply');
+    initWorkerPool({
+      sessionReply,
+      getSessionWorkingDir: () => '/repo',
+      getActiveCount: () => 1,
+      closeSession: vi.fn(),
+    });
+    const worker = makeFakeWorker();
+    const ds = makeDs({ worker });
+    ds.session.cliId = 'remote-runner';
+    ds.session.backendType = 'remote-runner';
+    ds.suppressRecoveryCard = undefined;
+    const reconcile = vi.fn(async () => true);
+    __testOnly_setupWorkerHandlers(ds, worker, {
+      ready: true,
+      failureNotified: false,
+      onRemoteBackendStartupExit: reconcile,
+    } as any);
+
+    worker.emit('message', {
+      type: 'claude_exit',
+      code: 1,
+      signal: null,
+    });
+    await flush();
+
+    expect(reconcile).not.toHaveBeenCalled();
+    expect(worker.kill).toHaveBeenCalledWith('SIGTERM');
+    expect(ds.worker).toBeNull();
+    expect(sessionReply).toHaveBeenCalledOnce();
+    expect(sessionReply.mock.calls[0]?.[1]).toEqual(expect.stringContaining('不支持重启'));
   });
 
   it('keeps remote rebuild reconciliation armed for the initial same-generation state replay', async () => {
@@ -573,7 +612,8 @@ describe('worker-pool lifecycle hook integration', () => {
       provider: 'reference',
       generation: 2,
     };
-    const reconcile = vi.fn(() => true);
+    ds.suppressRecoveryCard = true;
+    const reconcile = vi.fn(async () => true);
     const startupState = {
       ready: true,
       failureNotified: false,
@@ -606,6 +646,46 @@ describe('worker-pool lifecycle hook integration', () => {
     expect(ds.worker).toBeNull();
     expect(sessionReply).not.toHaveBeenCalled();
   });
+
+  it.each(['preparing', 'uncertain'] as const)(
+    'keeps a latched mojo %s close fence when the provider exits (fence clearing is remote-runner-only)',
+    async phase => {
+      const sessionReply = vi.fn(async () => 'om_reply');
+      initWorkerPool({
+        sessionReply,
+        getSessionWorkingDir: () => '/repo',
+        getActiveCount: () => 1,
+        closeSession: vi.fn(),
+      });
+      const worker = makeFakeWorker();
+      const ds = makeDs({ worker });
+      ds.session.cliId = 'mojo';
+      ds.session.backendType = 'mojo';
+      ds.remoteCloseState = { phase, requestId: 'mojo-close-req', taskId: 'sid-mojo' };
+      __testOnly_setupWorkerHandlers(ds, worker, {
+        ready: true,
+        failureNotified: false,
+      } as any);
+
+      worker.emit('message', {
+        type: 'claude_exit',
+        code: 1,
+        signal: null,
+      });
+      await flush();
+
+      // The dead provider worker is still retired, but the mojo close verdict
+      // must survive for durable journal reconciliation: clearing an in-flight
+      // fence on provider exit is deliberately scoped to remote-runner.
+      expect(worker.kill).toHaveBeenCalledWith('SIGTERM');
+      expect(ds.worker).toBeNull();
+      expect(ds.remoteCloseState).toEqual({
+        phase,
+        requestId: 'mojo-close-req',
+        taskId: 'sid-mojo',
+      });
+    },
+  );
 
   it('clears the persisted terminal port and Dashboard proxy state on worker exit', () => {
     const worker = makeFakeWorker();
@@ -700,6 +780,55 @@ describe('worker-pool lifecycle hook integration', () => {
       disposition: 'queued_removed',
     });
   });
+
+  it('exit handler isolates sessionStore.updateSession failures without skipping reconciliation', async () => {
+    const onWorkerExit = vi.fn();
+    initWorkerPool({
+      sessionReply: vi.fn(async () => 'om_reply'),
+      getSessionWorkingDir: () => '/repo',
+      getActiveCount: () => 1,
+      closeSession: vi.fn(),
+      onWorkerExit,
+    });
+    const worker = makeFakeWorker();
+    const ds = makeDs({ worker });
+    __testOnly_setupWorkerHandlers(ds, worker);
+
+    // Simulate a durable row-persist failure (SQLite busy timeout, disk full).
+    // The crash vector: the daemon has no global uncaughtException trap, so a
+    // throwing exit handler would take down every other session.
+    vi.mocked(updateSession).mockImplementationOnce(() => {
+      throw new Error('database is locked (SQLITE_BUSY: busy timeout)');
+    });
+
+    // The emit must NOT throw — the narrow try/catch around the persistence
+    // write isolates the failure and logs it instead of propagating.
+    expect(() => worker.emit('exit', 1, null)).not.toThrow();
+    await flush();
+
+    // The persistence failure was logged at the narrow catch site.
+    expect(logger.error).toHaveBeenCalledWith(
+      expect.stringContaining('Failed to persist worker exit generation'),
+    );
+    // Durable-exit reconciliation still ran exactly once despite the write failure.
+    expect(onWorkerExit).toHaveBeenCalledTimes(1);
+    expect(onWorkerExit).toHaveBeenCalledWith(
+      ds,
+      expect.objectContaining({ sessionId: 'sid-lifecycle-test', code: 1 }),
+    );
+    // The dashboard dormant-update and the session.exit lifecycle hook still
+    // fired exactly once: an active row's worker death publishes session.update
+    // (dormant) rather than session.exited (see worker-exit-dashboard-event.ts).
+    const dormantPublishes = dashboardEventBus.publish.mock.calls.filter(
+      ([event]) => (event as { type?: string; body?: { patch?: { status?: string } } })
+        .body?.patch?.status === 'dormant',
+    );
+    expect(dormantPublishes).toHaveLength(1);
+    expect(emitHookEventMock).toHaveBeenCalledWith(
+      'session.exit',
+      expect.objectContaining({ sessionId: 'sid-lifecycle-test', reason: 'exit_code_1' }),
+    );
+  });
 });
 
 describe('Codex App effort IPC', () => {
@@ -775,5 +904,96 @@ describe('Codex App effort IPC', () => {
     ds.cliReady = false;
     expect(await updateCodexAppEffort(ds, 'high')).toEqual({ status: 'unavailable' });
     expect(worker.send).not.toHaveBeenCalled();
+  });
+});
+
+
+describe('Codex CLI effort IPC', () => {
+  function fixture() {
+    const worker = makeFakeWorker();
+    const ds = makeDs({ worker, workerReady: true, cliReady: true, activeReasoningEffort: 'high' });
+    ds.session.cliId = 'codex';
+    ds.session.backendType = 'tmux';
+    ds.session.reasoningEffort = 'high';
+    ds.session.cliLaunchSnapshot = { cliId: 'codex', reasoningEffort: 'high' } as any;
+    ds.initConfig = { cliId: 'codex', backendType: 'tmux', reasoningEffort: 'high' } as any;
+    return { worker, ds };
+  }
+
+  it('persists confirmed future effort without changing the running turn or killing it', async () => {
+    const { worker, ds } = fixture();
+    const pending = updateCodexCliEffort(ds, 'max');
+    const request = worker.send.mock.calls[0][0];
+    expect(request).toMatchObject({ type: 'codex_cli_effort', effort: 'max' });
+    expect(ds.session.reasoningEffort).toBe('high');
+    worker.emit('message', { type: 'codex_cli_effort_result', requestId: request.requestId, status: 'future_only', reason: 'cli_next_turn' });
+    expect(await pending).toMatchObject({ status: 'future_only' });
+    expect(ds.session.reasoningEffort).toBe('max');
+    expect(ds.session.cliLaunchSnapshot?.reasoningEffort).toBe('max');
+    expect(ds.initConfig?.reasoningEffort).toBe('max');
+    expect(ds.activeReasoningEffort).toBe('high');
+    expect(sessionStore.updateSession).toHaveBeenCalledWith(ds.session);
+    expect(worker.kill).not.toHaveBeenCalled();
+  });
+
+  it('rolls back the saved preference if durable storage rejects the update', async () => {
+    const { worker, ds } = fixture();
+    vi.mocked(sessionStore.updateSession).mockImplementationOnce(() => { throw new Error('disk full'); });
+    const pending = updateCodexCliEffort(ds, 'max');
+    const request = worker.send.mock.calls[0][0];
+    worker.emit('message', { type: 'codex_cli_effort_result', requestId: request.requestId, status: 'future_only', reason: 'cli_next_turn' });
+    expect(await pending).toEqual({ status: 'error' });
+    expect(ds.session.reasoningEffort).toBe('high');
+    expect(ds.session.cliLaunchSnapshot?.reasoningEffort).toBe('high');
+    expect(ds.initConfig?.reasoningEffort).toBe('high');
+    expect(ds.codexCliEffortConfirmed).toBeUndefined();
+  });
+
+  it('allows explicit sandbox off and rejects active sandbox modes before IPC', async () => {
+    const { worker, ds } = fixture();
+    for (const sandbox of [true, 'oncall', 'scratch'] as const) {
+      ds.initConfig!.sandbox = sandbox;
+      expect(await updateCodexCliEffort(ds, 'max')).toMatchObject({ status: 'unavailable' });
+    }
+    expect(worker.send).not.toHaveBeenCalled();
+    ds.initConfig!.sandbox = 'off';
+    const pending = updateCodexCliEffort(ds, 'max');
+    const request = worker.send.mock.calls[0][0];
+    worker.emit('message', { type: 'codex_cli_effort_result', requestId: request.requestId, status: 'future_only', reason: 'cli_next_turn' });
+    expect(await pending).toMatchObject({ status: 'future_only' });
+  });
+
+  it.each(['workerGeneration', 'cliSessionId'])('rejects a receipt after the session %s changes', async field => {
+    const { worker, ds } = fixture();
+    const pending = updateCodexCliEffort(ds, 'max');
+    const request = worker.send.mock.calls[0][0];
+    Object.assign(ds.session, { [field]: field === 'workerGeneration' ? 2 : 'replacement-thread' });
+    worker.emit('message', { type: 'codex_cli_effort_result', requestId: request.requestId, status: 'future_only', reason: 'cli_next_turn' });
+    expect(await pending).toEqual({ status: 'error' });
+    expect(ds.session.reasoningEffort).toBe('high');
+  });
+
+  it('rejects stale worker receipts without changing the launch preference', async () => {
+    const { worker, ds } = fixture();
+    const pending = updateCodexCliEffort(ds, 'max');
+    const request = worker.send.mock.calls[0][0];
+    ds.worker = makeFakeWorker();
+    worker.emit('message', { type: 'codex_cli_effort_result', requestId: request.requestId, status: 'future_only', reason: 'cli_next_turn' });
+    expect(await pending).toEqual({ status: 'error' });
+    expect(ds.session.reasoningEffort).toBe('high');
+  });
+
+  it('serializes requests and cancels timed-out menu operations', async () => {
+    vi.useFakeTimers();
+    try {
+      const { worker, ds } = fixture();
+      const pending = updateCodexCliEffort(ds, 'max', 100);
+      expect(await updateCodexCliEffort(ds, 'low')).toMatchObject({ status: 'unavailable' });
+      await vi.advanceTimersByTimeAsync(100);
+      expect(await pending).toEqual({ status: 'error' });
+      expect(worker.send.mock.calls.at(-1)[0]).toMatchObject({ type: 'codex_cli_effort_cancel' });
+      expect(ds.session.reasoningEffort).toBe('high');
+      expect(worker.listenerCount('message')).toBe(0);
+    } finally { vi.useRealTimers(); }
   });
 });

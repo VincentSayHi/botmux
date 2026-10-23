@@ -84,13 +84,15 @@ export const BOT_PROXY_ROUTES: readonly ProxyRoute[] = [
   putBotConfig('ask-option-layout', { kind: 'json', maxBytes: ASK_OPTION_LAYOUT_REQUEST_MAX_BYTES }),
   // startup-commands：`{ startupCommands: string }`（逗号/换行分隔，'' = 清除）。
   putBotConfig('startup-commands'),
-  // custom-passthrough：`{ customPassthroughCommands: string }`（逗号/空格分隔，'' = 清除）。
+  // custom-passthrough：`{ customPassthroughCommands: string }`（逗号/换行或“空格+/”分隔，名字内空格归一为连字符，'' = 清除）。
   putBotConfig('custom-passthrough'),
   // cantalk-daemon-commands：`{ canTalkDaemonCommands: string }`（逗号/空格分隔，'' = 清除）。
   putBotConfig('cantalk-daemon-commands'),
   // launch-shell：`{ launchShell: string }`（shell 名或绝对路径；'' = 清除，回 $SHELL）。
   putBotConfig('launch-shell'),
   { ...putBotConfig('oncall-group'), decodeAppId: 'after-body' },
+  // actor-owner-bindings：完整替换 target Bot 的 source Bot 双 ID → Owner 策略。
+  putBotConfig('actor-owner-bindings'),
   putBotConfig('feedback'),
   {
     method: 'PUT',

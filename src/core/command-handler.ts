@@ -46,7 +46,7 @@ import { logger } from '../utils/logger.js';
 import { replyCardModeFor, updateTurnReplyCard } from './turn-reply-card.js';
 import { publicReplyCardActivity, publicReplyCardTools } from '../im/lark/turn-reply-card.js';
 import { scheduleTimeZone } from '../utils/timezone.js';
-import { killWorker, teardownAuthoritativePersistentBackingBeforeClose, suspendWorker, forkWorker, forkAdoptWorker, adoptSandboxBlocked, getCurrentCliVersion, postFreshStreamingCard, postPrivateSnapshotCard, resolvePrivateCardAudience, deliverEphemeralOrReply, deliverWritableTerminalCardTo, closeSession as closeWorkerPoolSession, withActiveSessionKeyLock, isResumeRecoveryPlaceholder, forkClosedSession, requestSessionRestart, isSessionTransferring, updateCodexAppEffort, sendWorkerInput, sendWorkerSessionInput, type WorkerSessionReplyOptions } from './worker-pool.js';
+import { killWorker, teardownAuthoritativePersistentBackingBeforeClose, suspendWorker, forkWorker, forkAdoptWorker, adoptSandboxBlocked, getCurrentCliVersion, postFreshStreamingCard, postPrivateSnapshotCard, resolvePrivateCardAudience, deliverEphemeralOrReply, deliverWritableTerminalCardTo, closeSession as closeWorkerPoolSession, withActiveSessionKeyLock, isResumeRecoveryPlaceholder, forkClosedSession, requestSessionRestart, isSessionTransferring, updateCodexAppEffort, updateCodexCliEffort, sendWorkerInput, sendWorkerSessionInput, type WorkerSessionReplyOptions } from './worker-pool.js';
 import {
   expandHome,
   getSessionWorkingDir,
@@ -62,7 +62,7 @@ import { discoverSlashCommandsForAdapter, listMcpServerNames, supportsFilesystem
 import { validateWorkingDir } from './working-dir.js';
 import { resolveRepoSelection } from './repo-selection.js';
 import { repinSessionWorkingDir } from './session-cwd.js';
-import { publishWorkingDirRecovery } from './working-dir-recovery.js';
+import { onlyUnstartedOpeningHolds, publishWorkingDirRecovery, reclaimUnstartedOpening } from './working-dir-recovery.js';
 import { validateAdoptTarget, adoptTargetKey, adoptTargetLabel, type AdoptableSession } from './session-discovery.js';
 import { validateZellijAdoptTarget } from './zellij-adopt-discovery.js';
 import { validateOrcaAdoptTarget } from './orca-adopt-discovery.js';
@@ -1880,8 +1880,9 @@ export async function handleCommand(
           await sessionReply(rootId, t('cmd.effort.usage', undefined, loc));
           break;
         }
-        const result = await updateCodexAppEffort(ds, effort);
-        const replyKey = result.status === 'future_only' && result.reason
+        const cliId = ds.session.cliLaunchSnapshot?.cliId ?? ds.session.cliId;
+        const result = await (cliId === 'codex' ? updateCodexCliEffort : updateCodexAppEffort)(ds, effort);
+        const replyKey = result.reason
           ? `cmd.effort.${result.reason}`
           : result.status === 'invalid' && !result.choices?.length
             ? 'cmd.effort.invalid_without_choices' : `cmd.effort.${result.status}`;
@@ -2944,6 +2945,17 @@ export async function handleCommand(
           break;
         }
         const repoArg = message.content.replace(/^\/repo\s*/, '').trim();
+        // A first message whose start was refused because the directory it fell
+        // back to is missing still holds the session; `/repo <路径>` picks the
+        // directory for it, like the recovery card (the no-card reply says so).
+        if (ds && !ds.pendingRepo && repoArg) reclaimUnstartedOpening(ds);
+        if (ds && !ds.pendingRepo && !repoArg && onlyUnstartedOpeningHolds(ds)) {
+          await sessionReply(
+            rootId,
+            t('worker.working_dir_missing_opening_text', { path: getSessionWorkingDir(ds) }, loc),
+          );
+          break;
+        }
         if (ds && !ds.pendingRepo
           && hasProtectedSessionMutationOwnership(ds)) {
           await sessionReply(
@@ -3096,6 +3108,7 @@ export async function handleCommand(
             const cardToWithdraw = current.repoCardMessageId;
             markRepoCardConsumed(current, cardToWithdraw);
             current.repoCardMessageId = undefined;
+            current.workingDirRecovery = undefined;
             return { current, cardToWithdraw };
           });
           if (!started) return false;
@@ -6202,7 +6215,7 @@ export async function handleCommand(
         const passthroughCommands = [...resolvePassthroughCommands(helpAppId, ds?.session.cliLaunchSnapshot?.cliId ?? ds?.session.cliId)];
         const help = [
           t('help.heading_session', undefined, loc),
-          ...((ds?.session.cliLaunchSnapshot?.cliId ?? ds?.session.cliId ?? botCfg?.cliId) === 'codex-app'
+          ...(['codex', 'codex-app'].includes(ds?.session.cliLaunchSnapshot?.cliId ?? ds?.session.cliId ?? botCfg?.cliId ?? '')
             ? [t('cmd.effort.usage', undefined, loc)] : []),
           t('help.close', { cliName }, loc),
           t('help.dismiss', undefined, loc),

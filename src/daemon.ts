@@ -1,3 +1,8 @@
+import { shareVcMeetingSummary } from './services/vc-meeting-summary-share.js';
+import { isCurrentBotInChat } from './im/lark/client.js';
+import { authorizeVcMeetingSummaryShare } from './services/vc-meeting-send-policy.js';
+import { globalVcMeetingAgentConfigLive } from './global-config.js';
+import { resolveVcMeetingListenerPolicy, vcMeetingSummaryShareTarget, type VcMeetingListenerPolicy } from './services/vc-meeting-listener-policy.js';
 import { createMessageListenerAutoCloseScheduler } from './core/message-listener-auto-close.js';
 import { deliverPublishedReport } from './core/report-publication.js';
 import { privateReplyEnabled, sendPrivateReply } from './core/private-reply.js';
@@ -17,6 +22,7 @@ import { parseBotSteerDirective } from './core/bot-steer-directive.js';
 import { readAllowedUsersResolveCache, writeAllowedUsersResolveCache } from './utils/allowed-users-cache.js';
 import { join, dirname, basename, isAbsolute, relative } from 'node:path';
 import { homedir, loadavg, cpus, totalmem, freemem } from 'node:os';
+import { activeVcMeetingInviters, createVcMeetingInviterGrant, type VcMeetingInviterGrant } from './services/vc-meeting-inviter-policy.js';
 import type { IncomingMessage, ServerResponse } from 'node:http';
 import { fileURLToPath } from 'node:url';
 
@@ -875,7 +881,7 @@ import {
   RealtimeVoiceSession,
 } from './vc-agent/realtime/index.js';
 import { createGroupWithBots } from './services/group-creator.js';
-import { addBotToChat, isInChat } from './services/groups-store.js';
+import { addBotToChat, isInChat, listChatMemberDisplays, addUsersToChatByOpenId } from './services/groups-store.js';
 import { initSessionGroups, isSessionGroup, getSessionGroup, touchSessionGroup } from './services/session-groups-store.js';
 import { maybeBirthSessionGroup, declinesSessionGroupBirthAsSlashCommand } from './core/session-group-birth.js';
 import { scheduleSessionGroupTitle } from './services/session-group-title.js';
@@ -2234,6 +2240,9 @@ type VcMeetingDaemonSession = {
   ended: boolean;
   joined: boolean;
   monitoringStarted: boolean;
+  inviterManagers?: VcMeetingInviterGrant[];
+  listenerChatCreatedForMeeting?: boolean;
+  inviterMembershipPromise?: Promise<void>;
   /** True after this listener bot's own participant_left event. Generic
    * activity must not infer presence again; only an explicit own join or a
    * successful forced join clears the fence. */
@@ -2268,6 +2277,7 @@ type VcMeetingDaemonSession = {
   textOutputPolicy: VcMeetingOutputPolicy;
   voiceOutputPolicy: VcMeetingOutputPolicy;
   syncIntervalMs?: number;
+  listenerPolicy?: VcMeetingListenerPolicy;
   consumerSelectionExpiresAt?: number;
   consumerSelectionNonce?: string;
   consumerCardMessageId?: string;
@@ -3479,7 +3489,18 @@ async function maybeCatchUpVcMeetingConsumerBeforeTurn(
   }
   ctx.vcMeetingContextMayLag = caughtUp.meetingContextMayLag;
   ctx.vcMeetingContextLifecycle = caughtUp.candidate.lifecycle;
+  const projection = getVcMeetingMemberProjection(config.session.dataDir, {
+    listenerAppId: caughtUp.candidate.listenerAppId, meetingId: caughtUp.candidate.meetingId,
+    memberId: caughtUp.candidate.memberId, memberEpoch: caughtUp.candidate.memberEpoch,
+  });
+  const summaryShareTargetChatId = vcMeetingSummaryShareTarget({
+    enabled: projection?.listenerPolicy?.allowSummarySharing === true,
+    senderType: parsed.senderType, messageType: parsed.msgType,
+    meetingId: caughtUp.candidate.meetingId, meetingNo: caughtUp.candidate.meetingNo,
+    text: stripLeadingMentions(parsed.content, parsed.mentions), quoted: !!parsed.parentId,
+  });
   ctx.vcMeetingImTurnOrigin = {
+    ...(summaryShareTargetChatId ? { summaryShareTargetChatId } : {}),
     listenerAppId: caughtUp.candidate.listenerAppId,
     meetingId: caughtUp.candidate.meetingId,
     memberId: caughtUp.candidate.memberId,
@@ -9284,6 +9305,52 @@ ipcRoute('POST', '/api/vc-meetings/deliveries/:deliveryKey/abandon', async (req,
   }
 });
 
+// Separate human-authorized IM sink. No durable transcript-origin fallback and
+// no caller-supplied destination; ordinary send routing remains fenced.
+ipcRoute('POST', '/api/vc-meetings/share-summary', async (req, res) => {
+  try {
+    const body = await readJsonBody<Record<string, unknown>>(req, 128 * 1024);
+    const receiverSessionId = typeof body.receiverSessionId === 'string' ? body.receiverSessionId : '';
+    const ds = receiverSessionId ? findActiveBySessionId(receiverSessionId) : undefined;
+    if (!ds?.session.vcMeetingReceiver || ds.larkAppId !== selfDaemonLarkAppId || typeof body.content !== 'string') {
+      return jsonRes(res, 403, { ok: false, errorCode: 'human_share_authorization_required' });
+    }
+    const origin = resolveVcMeetingImTurnOrigin(ds.session, ds.managedTurnOrigin?.turnId);
+    const assertAuthority = () => {
+      const current = authorizeVcMeetingSummaryShare(config.session.dataDir, {
+        session: ds.session, agentAppId: ds.larkAppId, liveOrigin: ds.managedTurnOrigin,
+        claimedCapability: typeof body.originCapability === 'string' ? body.originCapability : undefined,
+      });
+      if (current !== origin) throw new Error('share_turn_changed');
+    };
+    assertAuthority();
+    const checkAccess = async (chatId: string) => {
+      if (!await isCurrentBotInChat(ds.larkAppId, chatId)) throw new Error('target_bot_not_in_chat');
+      // Do not add scopes, invite members, or borrow another application's identity.
+      for (const id of new Set([ds.chatId, chatId])) {
+        if (!(await listChatMemberOpenIds(ds.larkAppId, id)).includes(origin!.replyTargetSenderOpenId!)) {
+          throw new Error('requester_not_in_source_or_target');
+        }
+      }
+    };
+    const result = await shareVcMeetingSummary({
+      dataDir: config.session.dataDir, origin: origin!, content: body.content,
+      assertAuthority, checkAccess,
+      send: (chatId, content, uuid) => sendMessage(ds.larkAppId, chatId, content, 'text', uuid, undefined, {
+        beforeWrite: async () => {
+          assertAuthority();
+          await checkAccess(chatId);
+          assertAuthority();
+        },
+      }),
+    });
+    return jsonRes(res, result.ok ? 200 : 409, result);
+  } catch (error) {
+    return jsonRes(res, 403, { ok: false, errorCode: 'summary_share_refused',
+      error: error instanceof Error ? error.message : String(error) });
+  }
+});
+
 // Agent-facing entry point. It never trusts caller-supplied agent/meeting
 // identity: the current worker capability/marker proves the live receiver turn,
 // then the durable receipt supplies the authoritative hub and membership.
@@ -9703,6 +9770,8 @@ function persistVcMeetingRuntimeSession(session: VcMeetingDaemonSession, cfg: Vc
     },
     listenerChatId,
     attentionTargetOpenId: session.state.attentionTargetOpenId,
+    inviterManagers: session.inviterManagers,
+    listenerChatCreatedForMeeting: session.listenerChatCreatedForMeeting,
     ...(session.consumerMode ? { consumerMode: session.consumerMode } : {}),
     ...(vcMeetingSessionUsesProfileMembers(session, cfg)
       ? { selectedAgents: session.selectedAgents }
@@ -9720,6 +9789,7 @@ function persistVcMeetingRuntimeSession(session: VcMeetingDaemonSession, cfg: Vc
       : {}),
     textOutputPolicy: session.textOutputPolicy,
     voiceOutputPolicy: session.voiceOutputPolicy,
+    listenerPolicy: resolveVcMeetingListenerPolicy(session.listenerPolicy),
     ...(session.syncIntervalMs !== undefined ? { syncIntervalMs: session.syncIntervalMs } : {}),
     ...(session.consumerSelectionExpiresAt !== undefined ? { consumerSelectionExpiresAt: session.consumerSelectionExpiresAt } : {}),
     ...(session.consumerCardMessageId ? { consumerCardMessageId: session.consumerCardMessageId } : {}),
@@ -9800,6 +9870,8 @@ function restoreVcMeetingRuntimeSessionsForBot(larkAppId: string, cfg: VcMeeting
     session.listenerPresenceGeneration = record.listenerPresenceGeneration;
     session.listenerRejoinNonce = record.listenerRejoinNonce;
     session.listenerRejoinCardMessageId = record.listenerRejoinCardMessageId;
+    session.inviterManagers = record.inviterManagers;
+    session.listenerChatCreatedForMeeting = record.listenerChatCreatedForMeeting;
     session.listenerChatId = record.listenerChatId;
     session.state.notificationChatId = record.listenerChatId;
     if (record.attentionTargetOpenId) session.state.attentionTargetOpenId = record.attentionTargetOpenId;
@@ -9812,6 +9884,7 @@ function restoreVcMeetingRuntimeSessionsForBot(larkAppId: string, cfg: VcMeeting
     session.textOutputPolicy = record.textOutputPolicy ?? defaultVcMeetingTextOutputPolicy(cfg);
     session.voiceOutputPolicy = record.voiceOutputPolicy ?? defaultVcMeetingVoiceOutputPolicy(cfg);
     session.syncIntervalMs = record.syncIntervalMs;
+    session.listenerPolicy = resolveVcMeetingListenerPolicy(record.listenerPolicy);
     session.consumerSelectionExpiresAt = record.consumerSelectionExpiresAt;
     session.consumerCardMessageId = record.consumerCardMessageId;
     session.temporaryInstructionOpenIds = Object.fromEntries(
@@ -9824,6 +9897,7 @@ function restoreVcMeetingRuntimeSessionsForBot(larkAppId: string, cfg: VcMeeting
     session.qaMode = record.qaMode ?? preparation?.qaMode;
     session.qaAgentAppId = record.qaAgentAppId ?? preparation?.agentAppId;
     session.qaRecentOutputHashes = record.qaRecentOutputHashes ?? [];
+    void synchronizeVcMeetingInviters(session, cfg).catch(err => logger.warn(`[vc-agent] inviter recovery: ${String(err)}`));
     const selectedAgentsBeforeReconcile = JSON.stringify(session.selectedAgents);
     const restoredProfileMemberships = session.consumerMode === 'agent'
       && session.selectedAgents.length > 0
@@ -10241,6 +10315,7 @@ function getOrCreateVcMeetingDaemonSession(
       joined: opts.joined === true,
       monitoringStarted: false,
       ...(listenerChatId ? { listenerChatId } : {}),
+      listenerPolicy: resolveVcMeetingListenerPolicy(globalVcMeetingAgentConfigLive().listenerPolicy, cfg.listenerPolicy),
       pendingItems: [],
       textOutputPolicy: defaultVcMeetingTextOutputPolicy(cfg),
       voiceOutputPolicy: defaultVcMeetingVoiceOutputPolicy(cfg),
@@ -10375,6 +10450,14 @@ function rememberVcMeetingActorIdentity(session: VcMeetingDaemonSession, actor: 
   if (unionId && name) session.actorNamesByUnionId[unionId] = name;
   if (openId && unionId) {
     session.actorUnionIdsByOpenId[openId] = unionId;
+    if (/^on_[A-Za-z0-9]+$/.test(unionId)) {
+      let changed = false;
+      for (const grant of session.inviterManagers ?? []) {
+        if (grant.openId === openId && grant.unionId !== unionId) { grant.unionId = unionId; changed = true; }
+      }
+      const cfg = changed ? effectiveVcMeetingAgentConfig(session.larkAppId) : undefined;
+      if (cfg) persistVcMeetingRuntimeSession(session, cfg);
+    }
     session.actorOpenIdsByUnionId[unionId] = openId;
   }
 }
@@ -10680,6 +10763,51 @@ function vcMeetingListenerChunkUuid(meetingId: string, chunk: string): string {
   return `vc_${meetingId.slice(-12)}_${hash}`;
 }
 
+async function synchronizeVcMeetingInviters(session: VcMeetingDaemonSession, cfg: VcMeetingAgentConfig): Promise<void> {
+  if (session.inviterMembershipPromise) {
+    await session.inviterMembershipPromise;
+    // A second invitation can arrive while the first member write is in flight.
+    return synchronizeVcMeetingInviters(session, cfg);
+  }
+  const chatId = session.listenerChatId;
+  const currentPolicy = () => effectiveVcMeetingAgentConfig(session.larkAppId) ?? {};
+  if (!chatId || session.ended || currentPolicy().inviterManagementEnabled !== true) return;
+  const pending = (session.inviterManagers ?? []).filter(g => !g.memberReady
+    && g.policyEnabledAt === (currentPolicy().inviterManagementEnabledAt ?? 0));
+  if (!pending.length) return;
+  const work = (async () => {
+    for (const grant of pending) {
+      try {
+        if (session.ended || session.listenerChatId !== chatId || currentPolicy().inviterManagementEnabled !== true
+          || grant.policyEnabledAt !== (currentPolicy().inviterManagementEnabledAt ?? 0)) break;
+        let members = await listChatMemberDisplays(session.larkAppId, chatId);
+        if (!members.some(m => m.openId === grant.openId && m.memberType !== 'bot')) {
+          // Never expand an owner-selected/shared/preparation group's visibility.
+          if (!session.listenerChatCreatedForMeeting) throw new Error('shared listener chat requires an existing membership');
+          if (session.ended || session.listenerChatId !== chatId || currentPolicy().inviterManagementEnabled !== true
+            || grant.policyEnabledAt !== (currentPolicy().inviterManagementEnabledAt ?? 0)) break;
+          const added = await addUsersToChatByOpenId(session.larkAppId, chatId, [grant.openId]);
+          if (added.invalidUserIds.length) throw new Error('inviter could not be added to listener chat');
+          members = await listChatMemberDisplays(session.larkAppId, chatId);
+          if (!members.some(m => m.openId === grant.openId && m.memberType !== 'bot')) throw new Error('listener membership not verified');
+        }
+        // A rejoin may redirect the session to a preparation chat during an API call.
+        if (session.listenerChatId !== chatId || session.ended) break;
+        // Saving after an off-toggle is harmless: every use checks the live policy/epoch.
+        grant.memberReady = true;
+        persistVcMeetingRuntimeSession(session, cfg);
+      } catch (err) {
+        logger.warn(`[vc-agent] inviter membership pending meeting=${session.state.meeting.id}: ${String(err)}`);
+        await sendMessage(session.larkAppId, chatId,
+          '本场邀请人尚未完成入群核验，未授予会议管理权。请确认应用可见范围和群成员权限；固定群需先由群管理员添加邀请人，再重新邀请助手重试。', 'text',
+          `vc_inviter_pending_${createHash('sha1').update(grant.eventId).digest('hex').slice(0, 16)}`).catch(() => undefined);
+      }
+    }
+  })();
+  session.inviterMembershipPromise = work;
+  try { await work; } finally { session.inviterMembershipPromise = undefined; }
+}
+
 async function ensureVcMeetingListenerChat(
   larkAppId: string,
   meeting: VcMeetingPushContext['meeting'],
@@ -10699,7 +10827,13 @@ async function ensureVcMeetingListenerChat(
     creatorLarkAppId: larkAppId,
     larkAppIds: [],
     name,
-    userOpenIds: [targetOpenId],
+    userOpenIds: [targetOpenId].filter(Boolean),
+    onChatCreated: chatId => {
+      session.listenerChatId = chatId;
+      session.state.notificationChatId = chatId;
+      session.listenerChatCreatedForMeeting = true;
+      persistVcMeetingRuntimeSession(session, cfg);
+    },
     transferOwnerTo: targetOpenId,
     notifyOwnerOpenId: targetOpenId,
   });
@@ -11074,6 +11208,9 @@ async function patchVcMeetingConsumerCard(
 
 function vcMeetingApproverOpenIds(session: VcMeetingDaemonSession, cfg: VcMeetingAgentConfig): Set<string> {
   const ids = new Set<string>();
+  for (const grant of activeVcMeetingInviters(effectiveVcMeetingAgentConfig(session.larkAppId) ?? {}, session.inviterManagers, session.ended)) {
+    if (!getBot(session.larkAppId).resolvedBlockedUsers.includes(grant.openId)) ids.add(grant.openId);
+  }
   if (session.state.attentionTargetOpenId) ids.add(session.state.attentionTargetOpenId);
   const target = vcMeetingTargetOpenId(session.larkAppId, cfg);
   if (target) ids.add(target);
@@ -11095,6 +11232,9 @@ function vcMeetingInstructionSourceOpenIds(session: VcMeetingDaemonSession, cfg:
 
 function vcMeetingApproverUnionIds(session: VcMeetingDaemonSession, cfg: VcMeetingAgentConfig): Set<string> {
   const ids = new Set<string>();
+  for (const grant of activeVcMeetingInviters(effectiveVcMeetingAgentConfig(session.larkAppId) ?? {}, session.inviterManagers, session.ended)) {
+    if (grant.unionId && !getBot(session.larkAppId).resolvedBlockedUsers.includes(grant.openId)) ids.add(grant.unionId);
+  }
   for (const openId of vcMeetingApproverOpenIds(session, cfg)) {
     const unionId = session.actorUnionIdsByOpenId?.[openId]?.trim();
     if (unionId) ids.add(unionId);
@@ -13567,6 +13707,17 @@ async function postVcMeetingMemberProjection(
   agentAppId: string,
   request: VcMeetingMemberProjectionRequest,
 ): Promise<{ status: number; body: unknown }> {
+  const session = vcMeetingSessions.get(vcMeetingSessionKey(request.meeting.listenerAppId, request.meeting.meetingId));
+  const prior = getVcMeetingMemberProjection(config.session.dataDir, {
+    listenerAppId: request.meeting.listenerAppId, meetingId: request.meeting.meetingId,
+    memberId: request.member.memberId, memberEpoch: request.member.epoch,
+  });
+  // Pause/remove/reconciliation may run after the runtime record has expired.
+  // Never replace an existing epoch's policy with today's defaults in that path.
+  const frozen = prior ? prior.listenerPolicy : session?.listenerPolicy
+    ?? listVcMeetingRuntimeSessions(config.session.dataDir, request.meeting.listenerAppId)
+      .find(record => record.meeting.id === request.meeting.meetingId)?.listenerPolicy;
+  request = { ...request, outputRoute: { ...request.outputRoute, listenerPolicy: resolveVcMeetingListenerPolicy(frozen) } };
   if (vcMeetingConsumerUsesLocalReceiver(agentAppId)) {
     const result = await registerVcMeetingMember(request, vcMeetingDeliveryReceiverDeps(agentAppId));
     return { status: result.status, body: result.body };
@@ -16979,6 +17130,10 @@ async function startVcMeetingMonitoring(input: {
 
       const preparation = resolveVcMeetingPreparation(input.larkAppId, meeting);
       if (preparation) {
+        if (session.listenerChatId !== preparation.prepChatId) {
+          session.listenerChatCreatedForMeeting = false;
+          for (const grant of session.inviterManagers ?? []) grant.memberReady = false;
+        }
         session.listenerChatId = preparation.prepChatId;
         session.state.notificationChatId = preparation.prepChatId;
         session.preparationMeetingNo = preparation.meetingNo;
@@ -17104,12 +17259,13 @@ async function flushVcMeetingListenerSession(
       ...pendingSnapshot,
       ...stableTranscripts,
     ];
-    const lines = buildVcMeetingListenerLines(session.state.meeting, itemsToSend, cfg, {
+    const rawMessages = resolveVcMeetingListenerPolicy(session.listenerPolicy).rawMessages;
+    const lines = rawMessages ? buildVcMeetingListenerLines(session.state.meeting, itemsToSend, cfg, {
       final: opts.final,
       actorNamesByOpenId: session.actorNamesByOpenId,
       actorNamesByUnionId: session.actorNamesByUnionId,
-    });
-    if (lines.length === 0) return { ok: true, sent: 0 };
+    }) : [];
+    if (rawMessages && lines.length === 0) return { ok: true, sent: 0 };
     const chunks = chunkVcMeetingListenerLines(lines);
     let sent = 0;
     for (const chunk of chunks) {
@@ -18514,6 +18670,27 @@ async function handleVcMeetingPush(ctx: VcMeetingPushContext): Promise<void> {
     }
     const session = getOrCreateVcMeetingDaemonSession(ctx.larkAppId, meeting, cfg, { joined: joinedByInvite });
     if (!session) return;
+    let inviterGrantUnavailable = cfg.inviterManagementEnabled === true;
+    let inviterBlocked = false;
+    if (ctx.inviter) {
+      const grant = createVcMeetingInviterGrant(cfg, { ...ctx.inviter, eventId: ctx.eventId });
+      if (grant && !getBot(session.larkAppId).resolvedBlockedUsers.includes(grant.openId)) {
+        inviterGrantUnavailable = false;
+        const grants = session.inviterManagers ??= [];
+        const current = grants.find(g => g.openId === grant.openId && g.policyEnabledAt === grant.policyEnabledAt);
+        if (!current) {
+          // Drop revoked generations rather than accumulating historic authority forever.
+          session.inviterManagers = grants.filter(g => g.policyEnabledAt === grant.policyEnabledAt);
+          session.inviterManagers.push(grant);
+          persistVcMeetingRuntimeSession(session, cfg);
+        }
+      } else if (cfg.inviterManagementEnabled === true) {
+        inviterBlocked = !!grant && getBot(session.larkAppId).resolvedBlockedUsers.includes(grant.openId);
+        logger.warn(inviterBlocked
+          ? '[vc-agent] inviter management skipped: inviter is blocked'
+          : '[vc-agent] inviter management skipped: invitation identity/time is not verifiable');
+      }
+    }
     const result = await startVcMeetingMonitoring({
       larkAppId: ctx.larkAppId,
       key,
@@ -18526,6 +18703,15 @@ async function handleVcMeetingPush(ctx: VcMeetingPushContext): Promise<void> {
       logger.warn(`[vc-agent] manual invite start failed meeting=${meeting.id}: ${result.error}`);
       notifyVcMeetingInviteFailure(ctx.larkAppId, cfg, session, meeting, result.error);
     } else {
+      await synchronizeVcMeetingInviters(session, cfg);
+      if (inviterGrantUnavailable) {
+        const eventHash = createHash('sha1').update(ctx.eventId ?? 'unknown').digest('hex').slice(0, 16);
+        await sendMessage(ctx.larkAppId, result.listenerChatId,
+          inviterBlocked
+            ? '本次邀请人命中机器人黑名单，未自动授予本场管理权；原授权人权限保持不变。'
+            : '本次邀请未取得可核验且有效的邀请人身份，未自动授予本场管理权；原授权人权限保持不变。',
+          'text', `vc_inviter_unverified_${eventHash}`).catch(() => undefined);
+      }
       deleteVcMeetingPendingInvite(key);
       if (result.key !== key) deleteVcMeetingPendingInvite(result.key);
     }
@@ -23076,6 +23262,10 @@ function vcMeetingApplicationContext(ctx: RoutingContext): string {
   return (ctx.vcMeetingImTurnOrigin
     ? VC_MEETING_HUMAN_IM_OUTPUT_CONTRACT
     : '')
+    + (ctx.vcMeetingImTurnOrigin?.summaryShareTargetChatId
+      ? '[会议纪要分享] 当前真人已授权将本场会议纪要发到 ' + ctx.vcMeetingImTurnOrigin.summaryShareTargetChatId
+        + '。请整理纪要和待办，然后用 `botmux vc-agent share-summary --content "纪要正文"` 提交。目标由宿主固定，不要使用 botmux send --chat-id 或会中输出。只有成功回执才可报告已发送。\n'
+      : '')
     + (ctx.vcMeetingContextLifecycle === 'sealed'
     ? '[会议上下文状态] 本轮正在复用一场已结束会议的专属会话；这是会后追问。可以基于既有会议上下文回答，但不得声称会议仍在进行，也不要尝试会中文本或语音动作。\n'
     : '')
